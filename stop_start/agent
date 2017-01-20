@@ -1,0 +1,194 @@
+#!/usr/bin/env python
+"""
+Script to stop/start/restart service, and collect service location.
+"""
+import commands
+import json
+import os
+import sys
+import time
+import logging
+import logging.handlers
+
+# suppress error messages, preventing it propagates to remote client.
+fnull = open(os.devnull, 'w')
+stdout_orig = sys.stdout
+stderr_orig = sys.stderr
+sys.stderr = fnull
+sys.stdout = fnull
+
+import subprocess  # noqa
+from optparse import OptionParser  # noqa
+from twisted.internet import defer  # noqa
+
+log = logging.getLogger('stop_start_node_service')
+fmt = logging.Formatter(
+    '%(asctime)s [-] [%(name)s:%(levelname)s] %(message)s')
+hdlr = logging.handlers.SysLogHandler()
+hdlr.setFormatter(fmt)
+logging.root.addHandler(hdlr)
+# and log to stdout
+stdoutfmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+stdouthdlr = logging.StreamHandler(sys.stdout)
+stdouthdlr.setFormatter(stdoutfmt)
+logging.root.addHandler(stdouthdlr)
+logging.root.setLevel(logging.DEBUG)
+
+
+MONIT_MANAGER = r'/usr/lib/nimbula/monit-service-manager'
+BIC_SERVICE = r'/usr/lib/nimbula/bic-service'
+BIC_SERVICE_BASE_DIR = r'/etc/nimbula/bic'
+CURL_CMD = r"curl -ks https://master:5000"
+
+services_location = {}
+
+
+def get_service_location(services):
+    """Get service location from zk
+    :param services: list of services
+    """
+    _, result = commands.getstatusoutput(CURL_CMD)
+    data = json.loads(result)
+    tmp_service = None
+    global services_location
+    try:
+        if "all" in services:
+            services_location = data['services']
+            return
+        for service in services:
+            # reference to data's data. no deep copy here.
+            tmp_service = service
+            services_location[service] = data['services'][service]
+    except KeyError as e:
+        raise Exception("Service {0} does not exist in bic. {1}".format(
+                        tmp_service, e))
+
+
+def run_command(cmdStr):
+    """
+    :param cmdStr: list of string
+    :return: output, return code
+    """
+    p = subprocess.Popen(cmdStr, stdout=subprocess.PIPE, stderr=sys.stderr)
+    output, _ = p.communicate()
+    return output, p.returncode
+
+
+def stop(services):
+    """
+    Stop service
+    :para services: list of service
+    """
+    for service in services:
+        # stop monit on service
+        cmd_list = [MONIT_MANAGER]
+        cmd_list.append("stop_service")
+        cmd_list.append(service)
+        print("stop monit service: {0}".format(service))
+        log.info("stop monit service: {0}".format(service))
+        _, rc = run_command(cmd_list)
+        if rc != 0:
+            log.warn("Stop monit for service: {0} failed".format(service))
+            raise Exception(
+                "Stop monit for service: {0} failed".format(service))
+
+        cmd_list = [BIC_SERVICE]
+        cmd_list.append(r'{0}/{1}'.format(BIC_SERVICE_BASE_DIR, service))
+        cmd_list.append("stop")
+        _, rc = run_command(cmd_list)
+        if rc != 0:
+            log.warn("Stop service: {0} failed".format(service))
+            raise Exception(
+                "Stop service: {0} failed".format(service))
+
+        cmd_list = ['mv']
+        cmd_list.append(r'{0}/{1}'.format(BIC_SERVICE_BASE_DIR, service))
+        cmd_list.append(r'{0}/{1}_bak'.format(BIC_SERVICE_BASE_DIR, service))
+        print("stop service: {0}".format(service))
+        log.info("stop service: {0}".format(service))
+        run_command(cmd_list)
+
+        # stop the renamed bic service to avoid monit still monitoring service.
+        cmd_list = [BIC_SERVICE]
+        cmd_list.append(r'{0}/{1}_bak'.format(BIC_SERVICE_BASE_DIR, service))
+        cmd_list.append("stop")
+        _, rc = run_command(cmd_list)
+        if rc != 0:
+            log.warn("Stop service: {0} failed".format(service))
+            raise Exception(
+                "Stop service: {0} failed".format(service))
+
+        # gluster mount/server is lingering even monit is turned off.
+        if service == "gluster_mount" or service == 'gluster_server':
+            tmp_service = {'gluster_mount': 'glusterfs',
+                           'gluster_server': 'glusterfsd'}
+            cmd = r"ps -ef | grep {0}| grep -v grep | ".format(
+                  tmp_service[service])
+            cmd = cmd + r"awk '{print $2}' | xargs kill"
+            commands.getstatusoutput(cmd)
+
+
+def start(service):
+    """
+    Start service
+    :para services: list of service
+    """
+    for service in services:
+        cmd_list = ['mv']
+        cmd_list.append(r'{0}/{1}_bak'.format(BIC_SERVICE_BASE_DIR, service))
+        cmd_list.append(r'{0}/{1}'.format(BIC_SERVICE_BASE_DIR, service))
+        print("start service: {0}".format(service))
+        log.info("start service: {0}".format(service))
+        run_command(cmd_list)
+
+        cmd_list = [BIC_SERVICE]
+        cmd_list.append(r'{0}/{1}'.format(BIC_SERVICE_BASE_DIR, service))
+        cmd_list.append("start")
+        run_command(cmd_list)
+
+        for i in xrange(3):
+            cmd_list = [BIC_SERVICE]
+            cmd_list.append(r'{0}/{1}'.format(BIC_SERVICE_BASE_DIR, service))
+            cmd_list.append("status")
+            _, rc = run_command(cmd_list)
+            if rc != 0:
+                time.sleep(7)  # delays for 7 seconds
+
+        # start monit on service
+        cmd_list = [MONIT_MANAGER]
+        cmd_list.append("start_service")
+        cmd_list.append(service)
+        print("start monit service: {0}".format(service))
+        log.info("start monit service: {0}".format(service))
+        run_command(cmd_list)
+
+
+if __name__ == "__main__":
+    parser = OptionParser(usage="usage: %prog [options] filename",
+                          version="%prog 1.0",
+                          description="Launch stop service script")
+    parser.add_option('--type',
+                      action='store', dest='acttype',
+                      choices=('stop', 'start', 'getloc'),
+                      help='script action type, either stop or start.')
+    opts, args = parser.parse_args()
+
+    if not args:
+        log.error("No service specified.")
+        raise Exception("No service specified.")
+    services = args[0].split(',')
+
+    if opts.acttype == "stop":
+        sys.stderr = stderr_orig
+        sys.stdout = stdout_orig
+        stop(services)
+    elif opts.acttype == 'start':
+        sys.stderr = stderr_orig
+        sys.stdout = stdout_orig
+        start(services)
+    elif opts.acttype == 'getloc':
+        get_service_location(services)
+        # enable stdout fd
+        sys.stdout = stdout_orig
+        log.info("service location: {0}".format(services_location))
+        print(services_location)

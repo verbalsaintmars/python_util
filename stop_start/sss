@@ -1,0 +1,303 @@
+#!/usr/bin/env python
+"""
+Stop/Start/Snapshot remote node services
+"""
+import ast
+import json
+import logging
+import logging.handlers
+import os
+import re
+import sys
+
+from nimbula.api import APIVERSION
+from nimbula.admin.nimbulaexec import opt_parser
+from nimbula.admin.nimbulaexec import init_nimbula_exec
+
+log = logging.getLogger("stop_start_services")
+
+fmt = logging.Formatter(
+    '%(asctime)s [-] [%(name)s:%(levelname)s] %(message)s')
+hdlr = logging.handlers.SysLogHandler()
+hdlr.setFormatter(fmt)
+logging.root.addHandler(hdlr)
+# and log to stdout
+stdoutfmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+stdouthdlr = logging.StreamHandler(sys.stdout)
+stdouthdlr.setFormatter(stdoutfmt)
+logging.root.addHandler(stdouthdlr)
+logging.root.setLevel(logging.DEBUG)
+
+
+INIT_STEP_DUMP_SNAPSHOT = 1
+INIT_STEP_START = 2
+INIT_STEP_STOP = 3
+DUMP_SNAP_SHOT_LOC = r'/tmp/__tmp_{0}_ss.json'
+
+
+def init(opts, step):
+    """
+    Init client
+    :param opts: options
+    :param step: in which state of init.
+    :return: list of services, service:loc dict, exec client, name of snapshot
+    """
+    name = opts.name if opts.name else parse_ip(opts.address)
+
+    client = init_nimbula_exec()
+
+    # fix for uploading script path
+    client.upload = opts.upload
+    # fix for nodes ip address format
+    client.nodes = opts.nodes
+    client.api_version = APIVERSION
+
+    services = [service.strip() for service in opts.services.split(',')]
+
+    def get_services_info():
+        # upload script to -n option specified node and get services location
+        client.populate_hosts()
+        client.run_command()
+
+        # run uploaded script to get services location
+        cmd = r'{0}/{1} --type {2} {3}'.\
+              format(opts.destination, os.path.basename(opts.upload),
+                     "getloc", opts.services)
+        log.info("Run remote getloc command: {0}".format(cmd))
+        client.command = cmd
+        loc_result_dict = client.run_command()
+        try:
+            for _, v in loc_result_dict.iteritems():
+                # loc_result contains key:value dict of service:location
+                loc_result = ast.literal_eval(v.strip())
+        except ValueError as e:
+            raise Exception("Parse remote script value error: {0}".format(e))
+        # dump service location snapshot
+        with open(DUMP_SNAP_SHOT_LOC.format(name), 'w') as fp:
+            json.dump(loc_result, fp)
+        return loc_result
+
+    if step == INIT_STEP_DUMP_SNAPSHOT:
+        loc_result = get_services_info()
+    elif step == INIT_STEP_STOP:
+        if not os.path.isfile(DUMP_SNAP_SHOT_LOC.format(name)):
+            loc_result = get_services_info()
+        else:
+            # load service location snapshot
+            with open(DUMP_SNAP_SHOT_LOC.format(name)) as data_file:
+                loc_result = json.load(data_file)
+    elif step == INIT_STEP_START:
+        if not os.path.isfile(DUMP_SNAP_SHOT_LOC.format(name)):
+            raise Exception("No snapshot provided. Run snapshop first.")
+        # load service location snapshot
+        with open(DUMP_SNAP_SHOT_LOC.format(name)) as data_file:
+            loc_result = json.load(data_file)
+
+    return services, loc_result, client, name
+
+
+def populate_agents(client):
+    """
+    populate agent to all admin nodes
+    :param client: nimbulaexec client
+    """
+    # populate scripts to all admin nodes(make it simple)
+    client.nodes = None
+    client.services = None
+    client.command = None
+    client.script = None  # only uploading script, not to run it.
+    client.populate_hosts()
+    result = client.get_task_hosts()
+    log.info("Populate script to admin nodes: {0}".format(result))
+    print("Populate script to admin nodes: {0}".format(result))
+    client.run_command()
+
+
+def parse_ip(text):
+    ip = re.findall(r'[0-9]+(?:\.[0-9]+){3}', text)
+    if ip:
+        return str(ip[0])
+    raise Exception("Node Ip Parse Error :{0}".format(text))
+
+
+def remove_script(opts, client):
+    """
+    delete agent in admin nodes
+    :param opts: options
+    :param client: inited nimbulaexec client
+    """
+    cmd = r"rm -f /tmp/{0}".format(os.path.basename(opts.upload))
+    client.nodes = None
+    client.services = None
+    client.command = None
+    client.script = None  # only uploading script, not to run it.
+    client.command = cmd
+    client.populate_hosts()
+    client.run_command()
+
+
+def snapshot(opts):
+    if not opts.upload:
+        raise Exception("No upload script provided.")
+
+    _, _, client, name = init(opts, INIT_STEP_DUMP_SNAPSHOT)
+    remove_script(opts, client)
+    print("Snapshot saved under :{0}".format(DUMP_SNAP_SHOT_LOC.format(name)))
+
+
+def stop(opts):
+    """
+    Stop remote node service
+    :param opts: options
+    """
+    if not opts.upload:
+        raise Exception("No upload script provided.")
+
+    services, loc_result, client, _ = init(opts, INIT_STEP_STOP)
+
+    # populate agents to admin nodes
+    populate_agents(client)
+
+    # run stop node service script on each related nodes
+    for service in services:
+        print("in service: {0}".format(service))
+        cmd = r'{0}/{1} --type stop {2}'.format(
+              opts.destination, os.path.basename(opts.upload), service)
+        print("Stop script: {0}".format(cmd))
+        log.info("Stop script: {0}".format(cmd))
+        client.nodes = None
+        client.services = None
+        client.script = None
+        client.command = cmd
+
+        nodes_str = ""
+
+        # loc type: list
+        if service == 'storage_metadata':
+            loc = loc_result['storage_master']
+        else:
+            loc = loc_result[service]
+
+        if len(loc) == 0:
+            continue
+
+        for n in loc:
+            nodes_str = "{0},{1}".format(n, nodes_str)
+        client.nodes = nodes_str[:-1]
+
+        print("Populate service: {0} to admin nodes :{1}".format(
+              service, client.nodes))
+        log.info("Populate service: {0} to admin nodes :{1}".format(
+              service, client.nodes))
+        client.populate_hosts()
+        client.run_command()
+    remove_script(opts, client)
+
+
+def start(opts):
+    """
+    Start remote node service
+    :param opts: options
+    """
+    if not opts.upload:
+        raise Exception("No upload script provided.")
+
+    services, loc_result, client, _ = init(opts, INIT_STEP_START)
+
+    # start in reverse order
+    services.reverse()
+
+    # populate agents to admin nodes
+    populate_agents(client)
+
+    # run stop node service script on each related nodes
+    for service in services:
+        cmd = r'{0}/{1} --type start {2}'.format(
+              opts.destination, os.path.basename(opts.upload), service)
+        print("Start script: {0}".format(cmd))
+        log.info("Start script: {0}".format(cmd))
+        client.nodes = None
+        client.services = None
+        client.script = None
+        client.command = cmd
+
+        nodes_str = ""
+
+        # loc type: list
+        if service == 'storage_metadata':
+            loc = loc_result['storage_master']
+        else:
+            loc = loc_result[service]
+
+        if len(loc) == 0:
+            continue
+
+        for n in loc:
+            nodes_str = "{0},{1}".format(n, nodes_str)
+        client.nodes = nodes_str[:-1]
+
+        print("Populate service: {0} to admin nodes :{1}".format(
+              service, client.nodes))
+        log.info("Populate service: {0} to admin nodes :{1}".format(
+              service, client.nodes))
+        client.populate_hosts()
+        client.run_command()
+    remove_script(opts, client)
+
+
+def run():
+    opt_parser.add_option('--name',
+                          action='store', dest='name',
+                          help='name of this site')
+    opt_parser.add_option('--services', '-s',
+                          action='store', dest='services',
+                          help='Nimbula nodes running the list of services or '
+                          'service hostnames separated by comma')
+
+    opt_parser.add_option('--nosudo',
+                          action='store_true', dest='nosudo',
+                          default=False,
+                          help='Run command in non-sudo mode '
+                          '(default is sudo mode)')
+
+    opt_parser.add_option('-c', '--command',
+                          action='store', dest='command',
+                          help='Shell command to be run on Nimbula nodes')
+
+    opt_parser.add_option('--put',
+                          action='store', dest='upload', default="agent",
+                          help='Upload file or directory (recursively) '
+                          'to Nimbula nodes')
+
+    opt_parser.add_option('-d', '--destination',
+                          action='store', dest='destination', default='/tmp',
+                          help='Destination path for upload/download '
+                          '(default is /tmp)')
+
+    opt_parser.add_option('--type',
+                          action='store', dest='acttype',
+                          choices=('stop', 'start', 'snapshot'),
+                          help='script action type, either stop or start.')
+
+    opts, _ = opt_parser.parse_args()
+
+    # prevent input node address with protocol provided.
+    if not opts.nodes:
+        opts.nodes = parse_ip(opts.address)
+    else:
+        opts.nodes = parse_ip(opts.nodes)
+
+    # agent script should be in the same dir of this script
+    opts.upload = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), opts.upload)
+
+    if opts.acttype == "stop":
+        stop(opts)
+    elif opts.acttype == "start":
+        start(opts)
+    elif opts.acttype == "snapshot":
+        snapshot(opts)
+
+
+if __name__ == "__main__":
+    run()

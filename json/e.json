@@ -1,0 +1,42 @@
+{
+  "default_ilom_password": "ADMIN000",
+  "default_ilom_user": "ADMIN",
+  "node_ilom": [
+      "scan07cn13-c.us.oracle.com",
+      "scan07cn14-c.us.oracle.com",
+      "scan07cn15-c.us.oracle.com",
+      "scan07cn16-c.us.oracle.com"
+  ],
+  "root_password": "nimbula",
+  "api_addr": "10.128.95.133",
+  "nodeuser": {
+                "user": "nimbulaadmin",
+                "password": "nimbula",
+                "uid": 1000
+              },
+  "siteconf": {
+      "network": {
+          "clusters": {
+              "10.128.95.176/28": {
+                  "router": "10.128.95.177",
+                  "subnet": "10.128.95.176/28",
+                  "admin_cluster": "False",
+                  "adminaddr": "10.128.95.180",
+                  "dns": ["10.128.41.16", "10.128.41.10"],
+                  "dns_ips": ["10.128.95.181", "10.128.95.182"],
+                  "api_dns_ips": ["10.128.95.184"],
+                  "dhcpstart": "10.128.95.186",
+                  "dhcpend": "10.128.95.189",
+                  "dhcp": "managed",
+                  "profiles": {
+                      "default": "default"
+                  },
+                  "instances": {
+                      "subnet": "10.196.88.0/21",
+                      "offset": "8"
+                  }
+              }
+          }
+      }
+  }
+}
